@@ -2,6 +2,8 @@ import { CardType, Color } from '../types';
 
 import { Card } from '../card';
 
+const stripAnsi = (s: string): string => s.replace(/\x1B\[[0-9;]*m/g, '');
+
 describe('Card', () => {
   describe('constructor', () => {
     it('should create a number card with correct properties', () => {
@@ -29,29 +31,29 @@ describe('Card', () => {
   describe('toString', () => {
     it('should return correct string for number card', () => {
       const card = new Card('red', 'number', 5);
-      expect(card.toString()).toBe('red 5');
+      expect(stripAnsi(card.toString())).toBe('RED 5');
     });
 
     it('should return correct string for special card', () => {
       const card = new Card('blue', 'skip');
-      expect(card.toString()).toBe('blue skip');
+      expect(stripAnsi(card.toString())).toBe('BLUE SKIP');
     });
 
     it('should return correct string for wild card', () => {
       const card = new Card('black', 'wild');
-      expect(card.toString()).toBe('black wild');
+      expect(stripAnsi(card.toString())).toBe('BLACK WILD');
     });
 
     it('should return correct string for wild4 card', () => {
       const card = new Card('black', 'wild4');
-      expect(card.toString()).toBe('black wild4');
+      expect(stripAnsi(card.toString())).toBe('BLACK WILD4');
     });
 
     it('should handle all colors correctly', () => {
       const colors: Color[] = ['red', 'blue', 'green', 'yellow', 'black'];
       colors.forEach((color) => {
         const card = new Card(color, 'number', 5);
-        expect(card.toString()).toBe(`${color} 5`);
+        expect(stripAnsi(card.toString())).toBe(`${color.toUpperCase()} 5`);
       });
     });
   });

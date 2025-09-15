@@ -1,11 +1,18 @@
 import * as readline from 'readline';
 
+import { BotPlayer, Player } from '../player';
 import { box, colorize } from '../utils/colors';
 
 import { Card } from '../card';
 import { Color } from '../types';
 import { Deck } from '../deck';
-import { Player } from '../player';
+
+class ControlFlowError extends Error {
+  constructor(public code: 'RESTART') {
+    super(code);
+    Object.setPrototypeOf(this, ControlFlowError.prototype);
+  }
+}
 
 export class Game {
   private deck: Deck;
@@ -22,7 +29,9 @@ export class Game {
   } | null = null;
   private specialCardMessage: string | null = null;
   private draw2Result: { player: Player; cardsDrawn: number } | null = null;
-  private drawnCards: { player: Player; cards: Card[] }[] = []; // Track the last player who called Uno
+  private drawnCards: { player: Player; cards: Card[] }[] = []; // Accumulates drawn cards to display at player's next human turn
+  private vsCpu: boolean = false;
+  private isRestarting: boolean = false;
 
   constructor() {
     this.deck = new Deck();
@@ -36,20 +45,95 @@ export class Game {
     this.isFirstTurn = true;
   }
 
-  private async askQuestion(question: string): Promise<string> {
+  private resetState(): void {
+    this.deck = new Deck();
+    this.players = [];
+    this.currentPlayerIndex = 0;
+    this.discardPile = [];
+    this.lastUnoCall = null;
+    this.isFirstTurn = true;
+    this.challengeResult = null;
+    this.specialCardMessage = null;
+    this.draw2Result = null;
+    this.drawnCards = [];
+    this.vsCpu = false;
+  }
+
+  private async confirmReset(): Promise<boolean> {
+    while (true) {
+      const ans = (await this.askRaw('Reset and start over? (y/n): ')).trim().toLowerCase();
+      if (ans === 'y') return true;
+      if (ans === 'n') return false;
+    }
+  }
+
+  private async askRaw(question: string): Promise<string> {
     return new Promise((resolve) => {
-      this.rl.question(question, (answer) => {
-        resolve(answer);
-      });
+      this.rl.question(question, (answer) => resolve(answer));
+    });
+  }
+
+  private formatPrompt(question: string): string {
+    return question.includes('type x to reset') ? question : `${question} (type x to reset)`;
+  }
+
+  private async askQuestion(question: string): Promise<string> {
+    const answer = await this.askRaw(question);
+    if (answer.trim().toLowerCase() === 'x') {
+      const shouldReset = await this.confirmReset();
+      if (shouldReset) {
+        this.isRestarting = true;
+        throw new ControlFlowError('RESTART');
+      }
+      // Continue normal flow: re-ask the original question
+      return this.askQuestion(question);
+    }
+    return answer;
+  }
+
+  private async askCatchUnoPrompt(timeoutMs: number): Promise<boolean> {
+    process.stdout.write(
+      `Type "uno" within ${Math.round(timeoutMs / 1000)} seconds to catch CPU! `
+    );
+    return new Promise((resolve) => {
+      let resolved = false;
+      const timer = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          process.stdout.write('\n');
+          resolve(false);
+        }
+      }, timeoutMs);
+
+      const lineHandler = async (input: string): Promise<void> => {
+        if (resolved) return;
+        const trimmed = input.trim().toLowerCase();
+        if (trimmed === 'x') {
+          const doReset = await this.confirmReset();
+          if (doReset) {
+            resolved = true;
+            clearTimeout(timer);
+            this.rl.removeListener('line', lineHandler as any);
+            this.isRestarting = true;
+            throw new ControlFlowError('RESTART');
+          } else {
+            return;
+          }
+        }
+        resolved = true;
+        clearTimeout(timer);
+        this.rl.removeListener('line', lineHandler as any);
+        resolve(trimmed === 'uno');
+      };
+
+      this.rl.once('line', lineHandler as any);
     });
   }
 
   private initializeGame(): void {
     console.log('Initializing game...');
-    // Shuffle the deck
     this.deck.shuffle();
 
-    // Deal 7 cards to each player
     for (let i = 0; i < 7; i++) {
       for (const player of this.players) {
         const card = this.deck.drawCard();
@@ -59,7 +143,6 @@ export class Game {
       }
     }
 
-    // Draw the first card for the discard pile
     const firstCard = this.deck.drawCard();
     if (firstCard) {
       this.discardPile.push(firstCard);
@@ -83,11 +166,9 @@ export class Game {
       return;
     }
 
-    // Keep the top card
     const topCard = this.discardPile.pop();
     if (!topCard) return;
 
-    // Move all other cards to the deck
     while (this.discardPile.length > 0) {
       const card = this.discardPile.pop();
       if (card) {
@@ -95,10 +176,8 @@ export class Game {
       }
     }
 
-    // Shuffle the deck
     this.deck.shuffle();
 
-    // Put the top card back
     this.discardPile.push(topCard);
     console.log('Deck has been reshuffled!');
   }
@@ -107,46 +186,49 @@ export class Game {
     currentPlayer: Player,
     nextPlayer: Player
   ): Promise<boolean> {
-    // Clear screen before showing challenge message
-    process.stdout.write('\x1B[2J\x1B[0;0H');
-    console.log(`\n${nextPlayer.name}, do you want to challenge the Wild Draw 4?`);
-    const answer = await this.askQuestion('Enter y to challenge, any other key to accept: ');
-
-    if (answer.toLowerCase() === 'y') {
-      // Check if the current player had a card of the same color as the previous top card
-      // Get the card before the wild4 was played
-      const previousTopCard = this.discardPile[this.discardPile.length - 3];
-      const hasMatchingColor = currentPlayer.getHand().some((card) => {
-        // Skip wild cards
-        if (card.color === 'black') return false;
-        // Check if the card has the same color as the previous top card
-        return card.color === previousTopCard.color;
-      });
-
-      if (hasMatchingColor) {
-        // Store challenge result
-        this.challengeResult = {
-          type: 'successful',
-          player: currentPlayer,
-          cardsDrawn: 4,
-        };
-        await this.drawCard(currentPlayer, 4, true);
-        // Challenger's turn continues
-        return true;
-      } else {
-        // Store challenge result
-        this.challengeResult = {
-          type: 'failed',
-          player: nextPlayer,
-          cardsDrawn: 6,
-        };
-        await this.drawCard(nextPlayer, 6);
-        // Challenger's turn continues
-        return true;
+    // If CPU is the one facing the Draw 4, automate decision
+    if (nextPlayer instanceof BotPlayer) {
+      const willChallenge = Math.random() < 0.5;
+      if (!willChallenge) {
+        await this.printWithDelay(`${nextPlayer.name} accepts the Draw 4.`);
+        return false;
       }
+      await this.printWithDelay(`${nextPlayer.name} challenges the Draw 4!`);
+    } else {
+      // Human decides whether to challenge
+      const answer = await this.askQuestion('Challenge the Wild Draw 4? (y/N): ');
+      const doChallenge = answer.trim().toLowerCase() === 'y';
+      if (!doChallenge) {
+        await this.printWithDelay(`${nextPlayer.name} accepts the Draw 4.`);
+        return false;
+      }
+      await this.printWithDelay(`${nextPlayer.name} challenges the Draw 4!`);
     }
-    // If not challenged, just return false
-    return false;
+
+    // Check if the current player had a card of the same color as the previous top card
+    const previousTopCard = this.discardPile[this.discardPile.length - 3];
+    const hasMatchingColor = currentPlayer.getHand().some((card) => {
+      if (card.color === 'black') return false;
+      return card.color === previousTopCard.color;
+    });
+
+    if (hasMatchingColor) {
+      this.challengeResult = {
+        type: 'successful',
+        player: currentPlayer,
+        cardsDrawn: 4,
+      };
+      await this.drawCard(currentPlayer, 4, currentPlayer === this.getCurrentPlayer());
+      return true;
+    } else {
+      this.challengeResult = {
+        type: 'failed',
+        player: nextPlayer,
+        cardsDrawn: 6,
+      };
+      await this.drawCard(nextPlayer, 6, nextPlayer === this.getCurrentPlayer());
+      return true;
+    }
   }
 
   private async delay(ms: number): Promise<void> {
@@ -154,9 +236,27 @@ export class Game {
   }
 
   private async printWithDelay(message: string, delayMs: number = 500): Promise<void> {
-    // Prevent screen clearing by using process.stdout.write with a newline
     process.stdout.write(message + '\n');
     await this.delay(delayMs);
+  }
+
+  private chooseBestColor(player: Player): Color {
+    const colors: Color[] = ['red', 'blue', 'green', 'yellow'];
+    const counts: Record<Color, number> = { red: 0, blue: 0, green: 0, yellow: 0, black: 0 } as any;
+    for (const c of player.getHand()) {
+      if (c.color !== 'black') {
+        counts[c.color as Color] = (counts[c.color as Color] || 0) + 1;
+      }
+    }
+    let best: Color = 'red';
+    let bestCount = -1;
+    for (const c of colors) {
+      if (counts[c] > bestCount) {
+        best = c;
+        bestCount = counts[c];
+      }
+    }
+    return best;
   }
 
   private async handleSpecialCardEffect(card: Card): Promise<void> {
@@ -164,7 +264,6 @@ export class Game {
     const currentPlayer = this.getCurrentPlayer();
     const nextPlayer = this.players[(this.currentPlayerIndex + 1) % this.players.length];
 
-    // Store any special card effects that need to be displayed later
     switch (effect) {
       case 'skip':
         this.specialCardMessage = colorize('Next player is skipped!', 'yellow');
@@ -173,15 +272,12 @@ export class Game {
 
       case 'reverse':
         this.specialCardMessage = colorize('Direction is reversed!', 'yellow');
-        // For 2 players, reverse acts like skip
         this.nextTurn();
         break;
 
       case 'draw2':
-        // Show the message to the current player
         await this.printWithDelay(colorize('Next player draws 2 cards!', 'yellow'));
         this.nextTurn();
-        // Store the actual drawing message for next turn
         this.draw2Result = {
           player: nextPlayer,
           cardsDrawn: 2,
@@ -190,9 +286,17 @@ export class Game {
         break;
 
       case 'wild': {
+        const isBot = currentPlayer instanceof BotPlayer;
+        if (isBot) {
+          const chosenColor = this.chooseBestColor(currentPlayer);
+          await this.printWithDelay(
+            `CPU changed color to ${colorize(chosenColor.toUpperCase(), chosenColor)}`
+          );
+          this.discardPile.push(new Card(chosenColor, 'wild'));
+          break;
+        }
         const colors: Color[] = ['red', 'blue', 'green', 'yellow'];
         let validColorSelected = false;
-
         while (!validColorSelected) {
           await this.printWithDelay('\nChoose a color:');
           colors.forEach((color, index) => {
@@ -200,7 +304,6 @@ export class Game {
           });
           const colorChoice = await this.askQuestion('Enter color number (1-4): ');
           const colorIndex = parseInt(colorChoice) - 1;
-
           if (!isNaN(colorIndex) && colorIndex >= 0 && colorIndex < colors.length) {
             validColorSelected = true;
             const chosenColor = colors[colorIndex];
@@ -215,10 +318,21 @@ export class Game {
         }
         break;
       }
+
       case 'wild4': {
+        const isBot = currentPlayer instanceof BotPlayer;
+        if (isBot) {
+          const chosenColor = this.chooseBestColor(currentPlayer);
+          await this.printWithDelay(
+            `CPU changed color to ${colorize(chosenColor.toUpperCase(), chosenColor)}`
+          );
+          this.discardPile.push(new Card(chosenColor, 'wild4'));
+          // Automated challenge decision
+          await this.handleWildDraw4Challenge(currentPlayer, nextPlayer);
+          break;
+        }
         const colors: Color[] = ['red', 'blue', 'green', 'yellow'];
         let validColorSelected = false;
-
         while (!validColorSelected) {
           await this.printWithDelay('\nChoose a color:');
           colors.forEach((color, index) => {
@@ -226,7 +340,6 @@ export class Game {
           });
           const colorChoice = await this.askQuestion('Enter color number (1-4): ');
           const colorIndex = parseInt(colorChoice) - 1;
-
           if (!isNaN(colorIndex) && colorIndex >= 0 && colorIndex < colors.length) {
             validColorSelected = true;
             const chosenColor = colors[colorIndex];
@@ -234,9 +347,8 @@ export class Game {
               `Color changed to ${colorize(chosenColor.toUpperCase(), chosenColor)}`
             );
             this.discardPile.push(new Card(chosenColor, 'wild4'));
-
-            // Handle draw 4 challenge
-            const challengeResult = await this.handleWildDraw4Challenge(currentPlayer, nextPlayer);
+            // Automated challenge decision
+            await this.handleWildDraw4Challenge(currentPlayer, nextPlayer);
             break;
           } else {
             await this.printWithDelay(colorize('Invalid color choice!', 'red'));
@@ -265,8 +377,14 @@ export class Game {
       }
     }
     if (cards.length > 0) {
+      if (player instanceof BotPlayer) {
+        // Summarize CPU draws without revealing specific cards
+        const plural = cards.length === 1 ? 'card' : 'cards';
+        await this.printWithDelay(`CPU drew ${cards.length} ${plural}.`, 300);
+        return cards;
+      }
       if (!isCurrentPlayer) {
-        // Accumulate drawn cards for this player across multiple effects/turns
+        // Accumulate drawn cards for this human player across multiple effects/turns
         const existing = this.drawnCards.find((dc) => dc.player === player);
         if (existing) {
           existing.cards.push(...cards);
@@ -336,17 +454,99 @@ export class Game {
         }
       }, timeoutMs);
 
-      const lineHandler = (input: string): void => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timer);
-          this.rl.removeListener('line', lineHandler);
-          resolve(input.trim().toLowerCase() === 'uno');
+      const lineHandler = async (input: string): Promise<void> => {
+        if (resolved) return;
+        const trimmed = input.trim().toLowerCase();
+        if (trimmed === 'x') {
+          const doReset = await this.confirmReset();
+          if (doReset) {
+            resolved = true;
+            clearTimeout(timer);
+            this.rl.removeListener('line', lineHandler as any);
+            this.isRestarting = true;
+            throw new ControlFlowError('RESTART');
+          } else {
+            return;
+          }
         }
+        resolved = true;
+        clearTimeout(timer);
+        this.rl.removeListener('line', lineHandler as any);
+        resolve(trimmed === 'uno');
       };
 
-      this.rl.once('line', lineHandler);
+      this.rl.once('line', lineHandler as any);
     });
+  }
+
+  private async handleBotTurn(bot: BotPlayer, topCard: Card): Promise<boolean> {
+    // Clear screen before CPU plays
+    process.stdout.write('\x1B[2J\x1B[0;0H');
+    console.log(box(`${bot.name}'s turn`));
+    console.log(`Top card: ${topCard.toString()}`);
+
+    const index = bot.chooseCardToPlay(topCard, this.isFirstTurn);
+    if (index !== null) {
+      const playedCard = bot.removeCard(index);
+      if (playedCard) {
+        this.discardPile.push(playedCard);
+        await this.delay(400);
+        await this.printWithDelay(`${bot.name} played: ${playedCard.toString()}`, 600);
+        await this.delay(500);
+        if (playedCard.isSpecialCard()) {
+          await this.handleSpecialCardEffect(playedCard);
+        }
+        // CPU UNO catch window if CPU has one card left
+        if (bot.getHandSize() === 1) {
+          const timeoutMs = (Math.floor(Math.random() * 5) + 1) * 1000; // 1-5 seconds
+          const caught = await this.askCatchUnoPrompt(timeoutMs);
+          if (caught) {
+            await this.printWithDelay('You caught CPU not saying UNO! CPU draws 2 cards.', 500);
+            await this.drawCard(bot, 2); // hidden draw for CPU
+            await this.delay(1000); // pause so player can read before screen clears
+          } else {
+            await this.printWithDelay('Too slow. CPU continues.', 500);
+            await this.delay(1000); // pause so player can read before screen clears
+          }
+        }
+        return true;
+      }
+    }
+
+    // No playable cards, draw one (do not reveal drawn card specifics)
+    await this.printWithDelay(`${bot.name} has no playable cards. Drawing a card...`, 400);
+    const drawn = await this.drawCard(bot, 1);
+    if (drawn && drawn.length > 0) {
+      const drawnCard = drawn[0];
+      if (drawnCard.canBePlayedOn(topCard, this.isFirstTurn)) {
+        const played = bot.removeCard(bot.getHandSize() - 1);
+        if (played) {
+          this.discardPile.push(played);
+          await this.printWithDelay(`${bot.name} played: ${played.toString()}`, 600);
+          await this.delay(500);
+          if (played.isSpecialCard()) {
+            await this.handleSpecialCardEffect(played);
+          }
+          // CPU UNO catch window if CPU has one card left
+          if (bot.getHandSize() === 1) {
+            const timeoutMs = (Math.floor(Math.random() * 5) + 1) * 1000;
+            const caught = await this.askCatchUnoPrompt(timeoutMs);
+            if (caught) {
+              await this.printWithDelay('You caught CPU not saying UNO! CPU draws 2 cards.', 500);
+              await this.drawCard(bot, 2);
+              await this.delay(1000);
+            } else {
+              await this.printWithDelay('Too slow. CPU continues.', 500);
+              await this.delay(1000);
+            }
+          }
+          return true;
+        }
+      }
+    }
+
+    await this.printWithDelay(`${bot.name} ends turn.`, 300);
+    return true;
   }
 
   private async handlePlayerTurn(): Promise<boolean> {
@@ -357,49 +557,45 @@ export class Game {
       throw new Error('No card on discard pile');
     }
 
+    if (this.vsCpu && currentPlayer instanceof BotPlayer) {
+      return this.handleBotTurn(currentPlayer, topCard);
+    }
+
     // Clear screen at start of turn
     process.stdout.write('\x1B[2J\x1B[0;0H');
 
-    // Display any special card messages from previous turn
     if (this.specialCardMessage) {
       console.log(this.specialCardMessage);
       this.specialCardMessage = null;
     }
 
-    // Display any challenge results from previous turn
     if (this.challengeResult) {
       const { type, player, cardsDrawn } = this.challengeResult;
       console.log(`Challenge ${type}! ${player.name} drew ${cardsDrawn} cards!`);
       this.challengeResult = null;
     }
 
-    // Display any draw2 results from previous turn
     if (this.draw2Result) {
       const { player, cardsDrawn } = this.draw2Result;
       console.log(`${player.name} drew ${cardsDrawn} cards!`);
       this.draw2Result = null;
     }
 
-    // Display current player's drawn cards from previous turn
     const currentDrawnCards = this.drawnCards.find((d) => d.player === currentPlayer)?.cards || [];
     if (currentDrawnCards.length > 0) {
-      // Display each card on a new line with a small delay
       for (const card of currentDrawnCards) {
         await this.printWithDelay(`You drew: ${card.toString()}`);
       }
-      // Remove this player's drawn cards from the array
       this.drawnCards = this.drawnCards.filter((d) => d.player !== currentPlayer);
     }
 
-    // Display current player's information
     console.log(box(`${currentPlayer.name}'s turn`));
     console.log(`Top card: ${topCard.toString()}`);
 
-    // Display player's hand (bold playable cards)
     console.log('\nYour hand:');
     const handDisplay = currentPlayer.displayHand(topCard, this.isFirstTurn);
     for (const cardDisplay of handDisplay) {
-      await this.printWithDelay(cardDisplay, 300); // Shorter delay between cards
+      await this.printWithDelay(cardDisplay, 300);
     }
 
     const hand = currentPlayer.getHand();
@@ -427,7 +623,6 @@ export class Game {
       return false;
     }
 
-    // Keep asking for input until a valid move is made
     while (true) {
       if (answer === '0') {
         const drawnCards = await this.drawCard(currentPlayer, 1, true);
@@ -446,7 +641,6 @@ export class Game {
       }
 
       if (selectedCard.canBePlayedOn(topCard, this.isFirstTurn)) {
-        // Clear isFirstTurn flag after a successful card play
         if (this.isFirstTurn) {
           this.isFirstTurn = false;
         }
@@ -465,7 +659,7 @@ export class Game {
               await this.handleUnoPenalty(currentPlayer);
             }
           }
-          await this.delay(500); // Longer pause before next turn
+          await this.delay(500);
           return true;
         }
       } else {
@@ -486,80 +680,102 @@ export class Game {
 
   public async start(): Promise<void> {
     try {
-      // Clear screen and show welcome message
-      process.stdout.write('\x1B[2J\x1B[0;0H');
-      await this.printWithDelay('\n' + box('Welcome to Uno!'), 1000);
+      while (true) {
+        try {
+          this.isRestarting = false;
+          this.resetState();
 
-      // Get number of players (default to 2 if empty)
-      const numPlayersAnswer = await this.askQuestion(
-        'How many players? (2-10, press Enter for default 2): '
-      );
-      const numPlayers = numPlayersAnswer ? parseInt(numPlayersAnswer) : 2;
-
-      if (numPlayers < 2 || numPlayers > 10) {
-        if (numPlayersAnswer) {
-          // Only show error if they actually entered a number
+          process.stdout.write('\x1B[2J\x1B[0;0H');
+          await this.printWithDelay('\n' + box('Welcome to Uno!'), 500);
           await this.printWithDelay(
-            colorize('Invalid number of players. Using default 2 players.', 'yellow')
+            colorize('Tip: Press x at any prompt to reset and start over.', 'yellow'),
+            800
           );
-        }
-        // Fall back to default 2 players
-        this.players = [new Player('PLAYER 1'), new Player('PLAYER 2')];
-        await this.printWithDelay('Initializing game with default 2 players...', 1000);
-        this.initializeGame();
-        return;
-      }
 
-      // Get player names (no duplicates)
-      const playerNames: string[] = [];
-      for (let i = 0; i < numPlayers; i++) {
-        let name = '';
-        while (true) {
-          name = await this.askQuestion(
-            `Enter name for Player ${i + 1} (or press Enter for default): `
-          );
-          const trimmedName = name.trim().toUpperCase() || `PLAYER ${i + 1}`;
+          // CPU default = Yes
+          const vsCpuAnswer = await this.askQuestion('Play against CPU? (Y/n): ');
+          const normalized = vsCpuAnswer.trim().toLowerCase();
+          this.vsCpu = normalized === '' || normalized === 'y';
 
-          if (playerNames.includes(trimmedName)) {
-            await this.printWithDelay(
-              colorize('Name already taken! Please choose a different name.', 'red')
+          if (this.vsCpu) {
+            const humanNameInput = await this.askQuestion(
+              'Enter your name (or press Enter for default): '
             );
+            const humanName = (humanNameInput.trim() || 'PLAYER 1').toUpperCase();
+            this.players = [new Player(humanName), new BotPlayer('CPU')];
+            await this.printWithDelay('Initializing game...', 500);
+            this.initializeGame();
+          } else {
+            const numPlayersAnswer = await this.askQuestion(
+              'How many players? (2-10, press Enter for default 2): '
+            );
+            const numPlayers = numPlayersAnswer ? parseInt(numPlayersAnswer) : 2;
+
+            if (numPlayers < 2 || numPlayers > 10) {
+              if (numPlayersAnswer) {
+                await this.printWithDelay(
+                  colorize('Invalid number of players. Using default 2 players.', 'yellow')
+                );
+              }
+              this.players = [new Player('PLAYER 1'), new Player('PLAYER 2')];
+              await this.printWithDelay('Initializing game with default 2 players...', 500);
+              this.initializeGame();
+            } else {
+              const playerNames: string[] = [];
+              for (let i = 0; i < numPlayers; i++) {
+                let name = '';
+                while (true) {
+                  name = await this.askQuestion(
+                    `Enter name for Player ${i + 1} (or press Enter for default): `
+                  );
+                  const trimmedName = name.trim().toUpperCase() || `PLAYER ${i + 1}`;
+                  if (playerNames.includes(trimmedName)) {
+                    await this.printWithDelay(
+                      colorize('Name already taken! Please choose a different name.', 'red')
+                    );
+                    continue;
+                  }
+                  playerNames.push(trimmedName);
+                  break;
+                }
+              }
+              this.players = playerNames.map((name) => new Player(name));
+              await this.printWithDelay('Initializing game...', 500);
+              this.initializeGame();
+            }
+          }
+
+          let gameOver = false;
+          while (!gameOver) {
+            let turnCompleted = false;
+            while (!turnCompleted) {
+              turnCompleted = await this.handlePlayerTurn();
+
+              const winner = this.checkWinner();
+              if (winner) {
+                await this.printWithDelay('\n' + box(`${winner.name} WINS!`), 500);
+                gameOver = true;
+                break;
+              }
+            }
+
+            if (!gameOver) {
+              const currentPlayer = this.getCurrentPlayer();
+              const nextPlayer = this.players[(this.currentPlayerIndex + 1) % this.players.length];
+              if (currentPlayer !== nextPlayer) {
+                await this.delay(300);
+              }
+              this.nextTurn();
+              this.isFirstTurn = false;
+            }
+          }
+
+          break;
+        } catch (err) {
+          if (err instanceof ControlFlowError && err.code === 'RESTART') {
             continue;
           }
-
-          playerNames.push(trimmedName);
-          break;
-        }
-      }
-
-      // Initialize game with the specified players
-      this.players = playerNames.map((name) => new Player(name));
-      await this.printWithDelay('Initializing game...', 1000);
-      this.initializeGame();
-
-      let gameOver = false;
-      while (!gameOver) {
-        let turnCompleted = false;
-        while (!turnCompleted) {
-          turnCompleted = await this.handlePlayerTurn();
-
-          const winner = this.checkWinner();
-          if (winner) {
-            await this.printWithDelay('\n' + box(`${winner.name} WINS!`), 1000);
-            gameOver = true;
-            break;
-          }
-        }
-
-        if (!gameOver) {
-          const currentPlayer = this.getCurrentPlayer();
-          const nextPlayer = this.players[(this.currentPlayerIndex + 1) % this.players.length];
-          if (currentPlayer !== nextPlayer) {
-            // Only delay if it's actually a new turn
-            await this.delay(500);
-          }
-          this.nextTurn();
-          this.isFirstTurn = false;
+          throw err;
         }
       }
     } catch (error) {
